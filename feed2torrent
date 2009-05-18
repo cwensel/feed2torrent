@@ -1,0 +1,425 @@
+#!/usr/bin/env python
+# encoding: utf-8
+"""Feed 2 Torrent
+
+Given a list of rss/atom feeds, will retrieve relevant torrent
+files, and spawn enhanced ctorrent instances to download the 
+files they reference.
+
+Visit http://www.slackyon.org/ for the latest version
+
+Recommended: Python 2.4.3 or later
+Requires: feedparser.py
+"""
+
+__version__ = "0.1.beta6"
+__license__ = """Copyright (c) 2006-2007, Chris K. Wensel, All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 'AS IS'
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE."""
+__author__ = "Chris K. Wensel <http://www.slackyon.org/>"
+
+import glob, sys, os, feedparser, re, urlparse, urllib, subprocess, re, time, marshal, signal, random
+from optparse import OptionParser
+from os.path import basename, join, exists
+
+max_ctorrents = 5
+rate_upload = "100"
+rate_download = "100"
+seed_hours = "72"
+cache_dir = ".cache"
+
+# <1>  Foo.S01E01.WS.DSR.XviD-ORENJi.avi [731568068] 0/5582 (0%)
+item_pattern = re.compile("^ *<[0-9]*> *([^ ]*) *\[[0-9]*\].*\(([0-9]*)\%\)$")
+# / 0/33/110 [672/672/672] 0MB,1130MB | 0,20K/s | 0,0K E:0,31
+item_status_pattern = re.compile(".*\[([0-9]*)/([0-9]*)/([0-9]*)\].*")
+tracker_error = re.compile(".*TRACKER FAILURE REASON.*")
+torrent_title = re.compile(" *\(-*[0-9]*S/-*[0-9]*L\) *") # remove the seed/leech data at the end of the title
+
+def as_torrent(torrent):
+  if torrent.find(cache_dir) != -1:
+    return basename(torrent)
+  elif torrent.endswith(".downloading"):
+    return basename(torrent).replace(".downloading", "")
+  else:
+    return torrent
+
+def as_debug(torrent):
+  if torrent.endswith(".downloading"):
+    torrent = as_torrent(torrent)
+  return '%s.debug' % torrent
+
+def as_downloading(torrent):
+  if torrent.endswith(".downloaded"):
+    torrent = as_torrent(torrent)
+  return '%s.downloading' % torrent
+
+def as_failed(torrent):
+  if torrent.endswith(".downloading"):
+    torrent = as_torrent(torrent)
+  return '%s.failed' % torrent
+
+def as_failed_ignore(torrent):
+  return join(cache_dir, as_failed(torrent))
+
+def as_downloaded(torrent):
+  return join(cache_dir, torrent)
+
+def file_from_torrent(torrent):
+  process = subprocess.Popen("strings '%s' | sed -n 's/.*name[0-9]*:\([^:]*\..\{3\}\)[0-9]*:.*/\\1/p'" % torrent, shell=True, bufsize=1, stdout=subprocess.PIPE, close_fds=True)
+  process.wait()
+  return process.stdout.readline().rstrip()
+
+def get_torrent_status(lines):
+  status = []
+  for line in lines:
+    match = item_pattern.match(line)
+
+    if match is not None:
+      status.append( (match.group(1), int(match.group(2))))
+
+  return status
+
+def get_status(lines):
+  for line in lines:
+    match = item_status_pattern.match(line.strip())
+    if match is not None:
+      return match.group(1,2,3)
+
+  return None
+
+def get_tracker_error(lines):
+  for line in lines:
+    match = tracker_error.match(line.strip())
+    if match is not None:
+      return True
+
+  return False
+
+def ctorrent_exists():
+  cmd = ['which', 'ctorrent']
+  process = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, close_fds=True)
+  process.wait()
+  return process.stdout.readline().strip() != ""
+
+def remove_torrent_files(torrent):
+  cmd = ['ctorrent', '-x', torrent]
+  process = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, close_fds=True)
+  process.wait()
+  lines = process.stdout.readlines()
+  directories = [line.replace("Directory: ", "").strip() for line in lines if line.startswith("Directory")]
+  files = [" ".join(line.strip().split(" ")[1:-1]).strip() for line in lines if line.startswith("<")]
+
+  if len(directories) != 0:
+    for directory in directories:
+      cmd = ['rm', '-rf', directory]
+      process = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, close_fds=True)
+  else:
+    for filename in files:
+      os.remove(filename)
+
+def launch():
+  if not ctorrent_exists():
+    print "ctorrent cannot be found, make sure it is in your path"
+    sys.exit(1)
+
+  if not exists(cache_dir):
+    os.makedirs(cache_dir)
+
+  torrent = options.torrent
+  torrent_downloading = as_downloading(torrent)
+  torrent_downloaded = as_downloaded(torrent)
+  os.rename(torrent,torrent_downloading)
+
+  if not exists(torrent_downloading):
+    raise IOError, "could not rename file: %s", torrent
+
+  complete = False
+  available = False
+  cmd = ['ctorrent', '-S', options.server, '-D', options.download, '-U', options.upload, '-e', options.seed, torrent_downloading]
+  min_wait = 5
+  sleep = 1
+  count = 1
+  try:
+    process = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True)
+
+    if options.debug:
+      debug_file = open(as_debug(torrent), 'w')
+      
+    while True:
+      lines = process.stdout.readline(300).split('\r')
+      status = get_status(lines)
+      
+      if status is not None:
+        available = status[1] == status[2]
+        complete = status[0] == status[1] or complete
+
+      if options.debug:
+        #debug_file.writeLines(lines)
+        debug_file.write("available: %s  complete: %s\n" % (available, complete))
+
+      if get_tracker_error(lines):
+        os.kill(process.pid, signal.SIGTERM)
+        process.wait()
+        if not complete:
+          remove_torrent_files(torrent_downloading)
+          os.rename(torrent_downloading, as_failed(torrent))
+          return
+        
+      if not options.keepalive and status is not None and not complete and not available and ((count * sleep)%(min_wait * 60)) == 0:
+        if len(glob.glob('*.torrent')) != 0:
+          os.kill(process.pid, signal.SIGTERM)
+      
+      if process.poll() != None:
+        break  
+        
+      time.sleep(sleep)
+      
+      count = count + 1
+        
+  except:
+    os.rename(torrent_downloading, torrent)
+    raise
+
+  if complete:
+    os.rename(torrent_downloading, torrent_downloaded)
+  else:
+    os.rename(torrent_downloading, torrent)
+
+def launch_ctorrent(torrent):
+  cmd = " ".join([sys.argv[0], '-S', options.server, '-D', options.download, '-U', options.upload, '-e', options.seed, '-t', '"%s"' % torrent, '&'])
+  subprocess.Popen(cmd, shell=True)
+
+def retrieve(title, link):
+  url = urlparse.urlparse(link)
+  path = torrent_title.sub('', title) + ".torrent"
+
+  # don't fetch if downloaded, or failed, or if the failed torrent is moved to the cache to be ignored
+  if exists(path) or exists(as_downloading(path)) or exists(as_downloaded(path)) or exists(as_failed(path)) or exists(as_failed_ignore(path)):
+    return
+
+  if options.prime:
+    path = as_downloaded(path)
+
+  link = link.replace('/tor/','/get/')
+  u = urllib.urlopen(link)
+  torrent = u.read()
+  f = file(path, 'wb')
+  f.write(torrent)
+  f.close()
+
+def readMetaFor(feed):
+  path = join(cache_dir,"%s.meta" % abs(hash(feed)))
+  
+  if not exists(path):
+    return (None,None)
+  
+  f = file(path, "r")
+  return marshal.load(f)
+
+def writeMetaFor(feed, etag, modified):
+  if etag == None and modified == None:
+    return
+  
+  path = join(cache_dir,"%s.meta" % abs(hash(feed)))
+  f = file(path, "w")
+  marshal.dump((etag,modified),f)
+
+def fetchfeed():
+  if not exists(options.feeds):
+    print "unable to open feed list named: %s" % options.feeds
+    sys.exit(1)
+
+  input = open(options.feeds,'r')
+  feeds = input.readlines()
+  input.close()
+  feeds = [feed.strip() for feed in feeds]
+  feeds = [feed for feed in feeds if feed != ""]
+  feeds = [feed for feed in feeds if not feed.startswith("#")]
+
+  for feed in feeds:
+    print 'Fetching feed: %s ' % feed
+    
+    etag,modified = readMetaFor(feed)
+    rss = feedparser.parse(feed, etag=etag, modified=modified)
+
+    if hasattr(rss, "etag"):
+      etag = rss.etag
+    if hasattr(rss, "modified"):
+      modified = rss.modified
+
+    writeMetaFor(feed, etag, modified)
+    
+    for entry in rss.entries:
+      retrieve(entry['title'], entry['link'])
+      print '  -- fetched torrent for: %s ' % entry['title']
+
+def spawn():
+  if not ctorrent_exists():
+    print "ctorrent cannot be found"
+    sys.exit(1)
+
+  downloading = glob.glob('*.downloading')
+  available = glob.glob('*.torrent')
+
+  spawn = min(options.max_spawn - len(downloading), len(available))
+
+  if spawn == 0:
+    sys.exit(0)
+
+  print 'Spawning %d ctorrents' % spawn
+
+  random.shuffle(available)
+  
+  for torrent in available:
+    print " launching %s" % torrent
+    launch_ctorrent(torrent)
+    spawn = spawn - 1
+    if spawn == 0:
+      break
+
+def clean_local():
+  print "cleaning local..."
+  downloading = glob.glob('*.downloading')
+  for torrent in downloading:
+    print "handling: " + as_torrent(torrent)
+    os.rename(torrent,as_torrent(torrent))
+
+def repair_cache():
+  print "repairing cache..."
+  downloaded = glob.glob(join(cache_dir,'*.torrent'))
+  for torrent in downloaded:
+    print "handling: " + as_torrent(torrent)
+    filename = file_from_torrent(torrent)
+
+    if not exists(filename):
+      print " -- skipping: " + filename
+      continue
+
+    cmd = ['ctorrent', '-c', torrent]
+    process = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, close_fds=True)
+    process.wait()
+    lines = process.stdout.readlines()
+    status = get_torrent_status(lines)
+
+    for filename, percent in status:
+      print "  -- %d%% of %s has been retrieved" % (percent, filename)
+
+      if percent == 0:
+        print " -- deleting file " + filename
+        if exists(filename):
+          os.remove(filename)
+
+      if percent < 100:
+        print " -- enabling torrent " + torrent
+        os.rename(torrent, as_torrent(torrent))
+      
+      print ""
+
+def main(argv=None):
+  global options
+  
+  parser = OptionParser(version=__version__,
+                        description="For fetching torrent files from given rss/atom feeds, "
+                                    "and launching ctorrent instances to download the files they reference. "
+                                    "Requires enhanced ctorrent to retrieve torrents (http://www.rahul.net/dholmes/ctorrent/).")
+  parser.set_defaults(spawn=False,
+                      fetch=False,
+                      prime=False,
+                      max_spawn=max_ctorrents,
+                      download=rate_download,
+                      upload=rate_upload,
+                      seed=seed_hours,
+                      server='localhost:2780',
+                      feeds="feeds")
+
+  parser.add_option("-F","--feeds",
+                    metavar="FILE",
+                    help="a list of feed urls to monitor. default: '%default'")
+  parser.add_option("-f","--fetch",
+                    action="store_true",
+                    help="if set, will fetch torrent files from feed")
+  parser.add_option("-s","--spawn",
+                    action="store_true",
+                    help="if set, will spawn ctorrent instances")
+  parser.add_option("-m","--max_spawn",
+                    type="int",
+                    metavar="NUM",
+                    help="max number of ctorrent instances to run. default: '%default'")
+  parser.add_option("-D","--download",
+                    metavar="RATE",
+                    help="the download rate. default: '%default'")
+  parser.add_option("-U","--upload",
+                    metavar="RATE",
+                    help="the upload rate. default: '%default'")
+  parser.add_option("-e","--seed",
+                    metavar="HOURS",
+                    help="the number of hours to seed after download. default: '%default'")
+  parser.add_option("-S","--server",
+                    metavar="HOSTNAME:PORT",
+                    help="the control server hostname and port. default: '%default'")
+  parser.add_option("-p","--prime",
+                    action="store_true",
+                    help="if set, will only download torrents from feeds, and mark them as downloaded. use to prevent mass downloading of files you already have.")
+  parser.add_option("-t","--torrent",
+                    metavar="FILE",
+                    help="a torrent to retrieve. called recursively by this application when spawning")
+  parser.add_option("-r","--repair",
+                    action="store_true",
+                    help="retrieves downloaded torrent files from cache if mistakenly stored, removes 'empty' binary files")
+  parser.add_option("-c","--clean",
+                    action="store_true",
+                    help="renames .downloading files to .torrent. only run if all torrents have stopped and .dowloading files are lingering")
+  parser.add_option("-d","--debug",
+                    action="store_true",
+                    help="dumps output to tmp file in current dir")
+  parser.add_option("-k","--keepalive",
+                    action="store_true",
+                    help="keeps ctorrent running")
+
+  options, args = parser.parse_args()
+  
+  if len(argv) == 0:
+    parser.print_help()
+          
+  if options.torrent != None:
+    launch()
+  
+  if options.clean:
+    clean_local()
+  
+  if options.repair:
+    repair_cache()
+  
+  if options.fetch:
+    fetchfeed()
+  
+  if options.spawn:
+      spawn()
+
+if __name__ == '__main__':
+  try:
+    main(sys.argv[1:])
+
+  except KeyboardInterrupt:
+    # Avoid traceback on CTRL+C
+    print "aborted by user"
+    sys.exit(1)

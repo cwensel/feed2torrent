@@ -1,0 +1,19 @@
+Feed2Torrent
+Fetch torrent files from atom/rss feeds.
+
+Copyright (c) 2007 by Chris K. Wensel
+open source, see LICENSE file for details
+
+-----
+
+To install, simply place in PATH.
+
+Requires:
+ Universal Feed Parser: http://feedparser.org
+ Enhanced Ctorrent: http://www.rahul.net/dholmes/ctorrent/ 
+
+For usage:
+$ feed2torrent -h
+
+Updates and documentation is available online at
+http://www.slackyon.org/
